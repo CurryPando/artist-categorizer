@@ -38,7 +38,7 @@ from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 from typing import Optional, Sequence
 
-from index import ingest_data, get_lyric_data_by_artist, chunk_lyric_dataframe
+from index import ingest_data, chunk_lyric_dataframe
 
 RANDOM_SEED = 42
 
