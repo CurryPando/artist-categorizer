@@ -11,7 +11,13 @@ def ingest_data(file_path: str, artists: set[str]) -> pd.DataFrame:
             raise ValueError(f"Column '{column}' must be of string type.")
     return raw_data
 
-def chunk_lyric_dataframe(df: pd.DataFrame, tokenizer: BertTokenizer, min_tokens: int = 64, max_tokens: int = 128, overlap: int = 16) -> tuple[list[str], list[str]]:
+def chunk_lyric_dataframe(
+    df: pd.DataFrame,
+    tokenizer: BertTokenizer,
+    min_tokens: int = 64,
+    max_tokens: int = 128,
+    overlap: int = 16,
+) -> tuple[list[str], list[str], list[str]]:
     """
     Groups a lyric dataframe by song, aggregates the lines, and splits them into 
     overlapping chunks based on token counts.
@@ -36,13 +42,12 @@ def chunk_lyric_dataframe(df: pd.DataFrame, tokenizer: BertTokenizer, min_tokens
         
     chunked_records = []
     
-    for (artist, _), group in df.groupby(['artist', 'song']):
+    for (artist, song), group in df.groupby(['artist', 'song']):
         # Combine all lines for this song into a single string, space-separated
         full_song_text = " ".join(group['lyric'].astype(str).str.strip().tolist())
         
         # Tokenize the entire song into token IDs (without padding/truncation yet)
-        tokenized = tokenizer(full_song_text, add_special_tokens=False)
-        input_ids = tokenized['input_ids']
+        input_ids = tokenizer.encode(full_song_text, add_special_tokens=False)
         
         total_tokens = len(input_ids)
         
@@ -50,7 +55,9 @@ def chunk_lyric_dataframe(df: pd.DataFrame, tokenizer: BertTokenizer, min_tokens
         if total_tokens <= max_tokens:
             if total_tokens >= min_tokens:
                 chunk_text = tokenizer.decode(input_ids, skip_special_tokens=True)
-                chunked_records.append({'artist': artist, 'chunk_lyric': chunk_text})
+                chunked_records.append(
+                    {'artist': artist, 'song_id': f"{artist}::{song}", 'chunk_lyric': chunk_text}
+                )
             continue
             
         # Sliding window logic
@@ -65,11 +72,14 @@ def chunk_lyric_dataframe(df: pd.DataFrame, tokenizer: BertTokenizer, min_tokens
                 
             # Decode token IDs back into actual text strings
             chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True)
-            chunked_records.append({'artist': artist, 'chunk_lyric': chunk_text})
+            chunked_records.append(
+                {'artist': artist, 'song_id': f"{artist}::{song}", 'chunk_lyric': chunk_text}
+            )
             
             # Slide the window forward
             start_idx += stride
 
     artists_out = [record['artist'] for record in chunked_records]
     lyrics_out = [record['chunk_lyric'] for record in chunked_records]
-    return artists_out, lyrics_out
+    song_ids_out = [record['song_id'] for record in chunked_records]
+    return artists_out, lyrics_out, song_ids_out

@@ -425,37 +425,19 @@ def predict(
     return predictions
 
 
-# ---------------------------------------------------------------------------
-# Visualize embeddings
-# ---------------------------------------------------------------------------
-
-def tsne_visualize_embeddings(
+def _extract_cls_embeddings(
     model: BertForSequenceClassification,
     tokenizer: BertTokenizer,
     device: torch.device,
-    texts: list[str],
-    labels: list[str],
-    max_length: int = 128,
-    batch_size: int = 16,
-):
-    """
-    Visualize embeddings of the given texts using the model.
-
-    Args:
-        model: Pretrained BERT model.
-        tokenizer: BERT tokenizer.
-        device: Torch device.
-        texts: List of texts to visualize.
-        labels: Optional list of labels for coloring the embeddings.
-        max_length: Maximum token length for the tokenizer.
-        batch_size: Batch size for processing texts.
-    """
-    model.eval()
-    model.to(device)
+    texts: Sequence[str],
+    max_length: int,
+    batch_size: int,
+) -> np.ndarray:
+    """Extract [CLS] embeddings for each input text."""
     embeddings = []
 
     for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i : i + batch_size]
+        batch_texts = list(texts[i : i + batch_size])
         encodings = tokenizer(
             batch_texts,
             truncation=True,
@@ -472,17 +454,95 @@ def tsne_visualize_embeddings(
         batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
         embeddings.append(batch_embeddings)
 
-    embeddings = np.vstack(embeddings)
+    return np.vstack(embeddings)
 
-    print(f"Generated embeddings for {len(texts)} texts, performing TSNE...")
+
+def _aggregate_embeddings_by_group(
+    embeddings: np.ndarray,
+    group_ids: Sequence[str],
+    labels: Optional[Sequence[str]] = None,
+) -> tuple[np.ndarray, Optional[list[str]]]:
+    """Average chunk-level embeddings into one embedding per group ID."""
+    if len(embeddings) != len(group_ids):
+        raise ValueError("embeddings and group_ids must have the same length")
+    if labels is not None and len(labels) != len(group_ids):
+        raise ValueError("labels and group_ids must have the same length")
+
+    group_order: list[str] = []
+    group_to_vectors: dict[str, list[np.ndarray]] = {}
+    group_to_label: dict[str, str] = {}
+
+    for idx, group_id in enumerate(group_ids):
+        if group_id not in group_to_vectors:
+            group_order.append(group_id)
+            group_to_vectors[group_id] = []
+        group_to_vectors[group_id].append(embeddings[idx])
+
+        if labels is not None and group_id not in group_to_label:
+            group_to_label[group_id] = str(labels[idx])
+
+    group_embeddings = np.vstack(
+        [np.mean(np.vstack(group_to_vectors[group_id]), axis=0) for group_id in group_order]
+    )
+    group_labels = [group_to_label[group_id] for group_id in group_order] if labels is not None else None
+    return group_embeddings, group_labels
+
+
+# ---------------------------------------------------------------------------
+# Visualize embeddings
+# ---------------------------------------------------------------------------
+
+def tsne_visualize_embeddings(
+    model: BertForSequenceClassification,
+    tokenizer: BertTokenizer,
+    device: torch.device,
+    texts: list[str],
+    song_ids: list[str],
+    labels: Optional[list[str]] = None,
+    max_length: int = 128,
+    batch_size: int = 16,
+):
+    """
+    Visualize embeddings of the given texts using the model.
+
+    Args:
+        model: Pretrained BERT model.
+        tokenizer: BERT tokenizer.
+        device: Torch device.
+        texts: List of chunked texts to visualize.
+        song_ids: Song identifier for each chunk in texts.
+        labels: Optional list of labels for coloring each song embedding.
+        max_length: Maximum token length for the tokenizer.
+        batch_size: Batch size for processing texts.
+    """
+    model.eval()
+    model.to(device)
+    chunk_embeddings = _extract_cls_embeddings(
+        model,
+        tokenizer,
+        device,
+        texts,
+        max_length=max_length,
+        batch_size=batch_size,
+    )
+    song_embeddings, song_labels = _aggregate_embeddings_by_group(
+        chunk_embeddings,
+        song_ids,
+        labels=labels,
+    )
+
+    print(
+        f"Generated embeddings for {len(texts)} chunks and aggregated to "
+        f"{len(song_embeddings)} songs, performing TSNE..."
+    )
 
     tsne = TSNE(n_components=2, random_state=RANDOM_SEED)
-    embeddings_2d = tsne.fit_transform(embeddings)
+    embeddings_2d = tsne.fit_transform(song_embeddings)
 
     plt.figure(figsize=(10, 10))
-    if labels is not None:
-        for label in set(labels):
-            idxs = [i for i, l in enumerate(labels) if l == label]
+    if song_labels is not None:
+        for label in set(song_labels):
+            idxs = [i for i, l in enumerate(song_labels) if l == label]
             plt.scatter(embeddings_2d[idxs, 0], embeddings_2d[idxs, 1], label=label)
         plt.legend()
     else:
@@ -494,42 +554,38 @@ def pca_visualize_embeddings(
     tokenizer: BertTokenizer,
     device: torch.device,
     texts: list[str],
-    labels: list[str],
+    song_ids: list[str],
+    labels: Optional[list[str]] = None,
     max_length: int = 128,
     batch_size: int = 16,
 ):
     model.eval()
     model.to(device)
-    embeddings = []
+    chunk_embeddings = _extract_cls_embeddings(
+        model,
+        tokenizer,
+        device,
+        texts,
+        max_length=max_length,
+        batch_size=batch_size,
+    )
+    song_embeddings, song_labels = _aggregate_embeddings_by_group(
+        chunk_embeddings,
+        song_ids,
+        labels=labels,
+    )
 
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i : i + batch_size]
-        encodings = tokenizer(
-            batch_texts,
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        with torch.no_grad():
-            outputs = model.bert(
-                input_ids=encodings["input_ids"].to(device),
-                attention_mask=encodings["attention_mask"].to(device),
-                token_type_ids=encodings["token_type_ids"].to(device),
-            )
-        batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-        embeddings.append(batch_embeddings)
-
-    embeddings = np.vstack(embeddings)
-
-    print(f"Generated embeddings for {len(texts)} texts, performing PCA...")
+    print(
+        f"Generated embeddings for {len(texts)} chunks and aggregated to "
+        f"{len(song_embeddings)} songs, performing PCA..."
+    )
     pca = PCA(n_components=2, random_state=RANDOM_SEED)
-    embeddings_2d = pca.fit_transform(embeddings)
+    embeddings_2d = pca.fit_transform(song_embeddings)
 
     plt.figure(figsize=(10, 10))
-    if labels is not None:
-        for label in set(labels):
-            idxs = [i for i, l in enumerate(labels) if l == label]
+    if song_labels is not None:
+        for label in set(song_labels):
+            idxs = [i for i, l in enumerate(song_labels) if l == label]
             plt.scatter(embeddings_2d[idxs, 0], embeddings_2d[idxs, 1], label=label)
         plt.legend()
     else:
@@ -563,7 +619,13 @@ if __name__ == "__main__":
     df = ingest_data(DATA_PATH, ARTISTS)
 
     # Training Data
-    artists, lyrics = chunk_lyric_dataframe(df, tokenizer, min_tokens=32, max_tokens=64, overlap=8)
+    artists, lyrics, song_ids = chunk_lyric_dataframe(
+        df,
+        tokenizer,
+        min_tokens=32,
+        max_tokens=64,
+        overlap=8,
+    )
     artist_to_index = {artist: idx for idx, artist in enumerate(ARTISTS)}
     label_nums = [artist_to_index[artist] for artist in artists]
 
@@ -587,6 +649,7 @@ if __name__ == "__main__":
     class_weights = [total_samples / (NUM_LABELS * class_count) for class_count in class_counts]
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
 
+    """
     # ── 4. Fine-tune ──────────────────────────────────────────────────────
     print("\n[Stage 2] Fine-tuning...\n")
     model, train_loss_history, val_loss_history = fine_tune(
@@ -596,8 +659,11 @@ if __name__ == "__main__":
         learning_rate=LR,
         save_path=SAVE_PATH,
     )
-    
     # model = load_saved_model(SAVE_PATH, model)
+    """
+
+    # load from saved model
+    #model = load_saved_model(SAVE_PATH, model)
 
     # ── 5. Evaluate ───────────────────────────────────────────────────────
     print("\n[Stage 3] Evaluating on validation set...\n")
@@ -619,4 +685,4 @@ if __name__ == "__main__":
 
     # Visualize embeddings with PCA
     print("\n[Stage 4] Visualizing embeddings with PCA...\n")
-    pca_visualize_embeddings(model, tokenizer, device, lyrics, artists)
+    pca_visualize_embeddings(model, tokenizer, device, lyrics, song_ids, artists)
