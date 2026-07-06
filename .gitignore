@@ -1,4 +1,4 @@
-best_bert_classifier.pt
+saved_model/
 updated_rappers.csv
 loss_plot.png
 .venv

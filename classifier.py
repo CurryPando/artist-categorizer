@@ -12,13 +12,12 @@ Dependencies:
 
 # TODO:
 # Use DistilBERT or ALBERT for faster training if computational resources are limited.
-# Apply techniques like early stopping or learning rate scheduling to prevent overfitting.
-# Hyperparameter tuning 
 # Clustering
 # Deploying using FastAPI
 
 from __future__ import annotations
 
+import json
 import random
 import numpy as np
 import torch
@@ -730,12 +729,16 @@ if __name__ == "__main__":
     ARTISTS = {'Drake', 'Eminem', 'Future', 'Kendrick Lamar', 'Kanye West'}
 
     # Configuration
-    MODEL_NAME    = "bert-base-uncased"
-    NUM_LABELS    = len(ARTISTS)
-    MAX_LENGTH    = 128
-    EPOCHS        = 4
-    OPTUNA_TRIALS = 5
-    SAVE_PATH     = "best_bert_classifier.pt"  # set to None to skip saving
+    MODEL_NAME     = "bert-base-uncased"
+    NUM_LABELS     = len(ARTISTS)
+    MAX_LENGTH     = 128
+    EPOCHS         = 4
+    OPTUNA_TRIALS  = 3
+    BATCH_SIZE     = 32
+    LOAD_MODEL     = True  # set to False to fine-tune from scratch
+    SAVE_PATH_BERT = "saved_model/best_bert_classifier.pt"  # set to None to skip saving
+    SAVE_PATH_LBLS = "saved_model/label_map.json"  # set to None to skip saving label map
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
@@ -756,66 +759,78 @@ if __name__ == "__main__":
         max_tokens=MAX_LENGTH,
         overlap=MAX_LENGTH//8,
     )
-    artist_to_index = {artist: idx for idx, artist in enumerate(ARTISTS)}
+    artist_to_index = {}
+    if LOAD_MODEL:
+        with open(SAVE_PATH_LBLS, "r") as f:
+            artist_to_index = json.load(f)
+    else:
+        artist_to_index = {artist: idx for idx, artist in enumerate(ARTISTS)}
+        with open(SAVE_PATH_LBLS, "w") as f:
+            json.dump(artist_to_index, f)
     label_nums = [artist_to_index[artist] for artist in artists]
-
-    print(lyrics[:5])
 
     # ── 3. Class weights calculations ─────────────────────────────────────
     class_counts = [label_nums.count(i) for i in range(NUM_LABELS)]
     total_samples = sum(class_counts)
     class_weights = [total_samples / (NUM_LABELS * class_count) for class_count in class_counts]
     class_weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
-
-    # ── 4. Hyperparameter Optimization with Optuna ────────────────────────
-    print("\n[Stage 2] Running Bayesian Optimization with Optuna...")
-    best_params = optimize_hyperparameters(
-        lyrics=lyrics,
-        label_nums=label_nums,
-        tokenizer=tokenizer,
-        device=device,
-        num_labels=NUM_LABELS,
-        class_weights_tensor=class_weights_tensor,
-        n_trials=OPTUNA_TRIALS,
-        epochs=EPOCHS,
-        max_length=MAX_LENGTH,
-    )
-
-    # Extract best hyperparams
-    best_lr = best_params["learning_rate"]
-    best_weight_decay = best_params["weight_decay"]
-    best_warmup_ratio = best_params["warmup_ratio"]
-    # best_batch_size = best_params["batch_size"]
-    best_batch_size = 32
-
-    # ── 5. Fine-tune Final Model with Optimal Hyperparameters ──────────────
-    print("\n[Stage 3] Fine-tuning final model with optimal hyperparameters...\n")
-    # Prepare loaders with optimal batch_size
+    
+    # Prepare loaders
     train_loader, val_loader = preprocess(
         lyrics, label_nums, tokenizer,
         max_length=MAX_LENGTH,
         val_split=0.2,
-        batch_size=best_batch_size,
+        batch_size=BATCH_SIZE,
     )
 
-    # Load fresh model for final training
-    final_model = BertForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=NUM_LABELS
-    )
+    if LOAD_MODEL:
+        print(f"Skipping stage 2 & 3, loading saved model from: {SAVE_PATH_BERT}")
+        final_model = BertForSequenceClassification.from_pretrained(
+            MODEL_NAME, num_labels=NUM_LABELS
+        )
+        final_model = load_saved_model(SAVE_PATH_BERT, final_model)
+    else:
+        # ── 4. Hyperparameter Optimization with Optuna ────────────────────────
+        print("\n[Stage 2] Running Bayesian Optimization with Optuna...")
+        best_params = optimize_hyperparameters(
+            lyrics=lyrics,
+            label_nums=label_nums,
+            tokenizer=tokenizer,
+            device=device,
+            num_labels=NUM_LABELS,
+            class_weights_tensor=class_weights_tensor,
+            n_trials=OPTUNA_TRIALS,
+            epochs=EPOCHS,
+            max_length=MAX_LENGTH,
+        )
 
-    final_model, train_loss_history, val_loss_history = fine_tune(
-        model=final_model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        class_weights_tensor=class_weights_tensor,
-        epochs=EPOCHS,
-        learning_rate=best_lr,
-        weight_decay=best_weight_decay,
-        warmup_ratio=best_warmup_ratio,
-        save_path=SAVE_PATH,
-        early_stopping_patience=1,  # Early stop the final run too if it starts overfitting
-    )
+        # Extract best hyperparams
+        best_lr = best_params["learning_rate"]
+        best_weight_decay = best_params["weight_decay"]
+        best_warmup_ratio = best_params["warmup_ratio"]
+        # best_batch_size = best_params["batch_size"]
+
+        # ── 5. Fine-tune Final Model with Optimal Hyperparameters ──────────────
+        print("\n[Stage 3] Fine-tuning final model with optimal hyperparameters...\n")
+        
+        # Load fresh model for final training
+        final_model = BertForSequenceClassification.from_pretrained(
+            MODEL_NAME, num_labels=NUM_LABELS
+        )
+
+        final_model, train_loss_history, val_loss_history = fine_tune(
+            model=final_model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            class_weights_tensor=class_weights_tensor,
+            epochs=EPOCHS,
+            learning_rate=best_lr,
+            weight_decay=best_weight_decay,
+            warmup_ratio=best_warmup_ratio,
+            save_path=SAVE_PATH_BERT,
+            early_stopping_patience=1,  # Early stop the final run too if it starts overfitting
+        )
 
     # ── 6. Evaluate ───────────────────────────────────────────────────────
     print("\n[Stage 4] Evaluating on validation set...\n")
