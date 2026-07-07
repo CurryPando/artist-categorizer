@@ -1,332 +1,25 @@
-"""
-BERT Text Classification Pipeline
-==================================
-Covers three stages:
-  1. Preprocessing  - tokenize raw texts into BERT-ready tensors
-  2. Fine-tuning    - train a BertForSequenceClassification model
-  3. Evaluation     - accuracy, F1, confusion matrix, classification report
-
-Dependencies:
-    pip install torch transformers scikit-learn numpy
-"""
-
 # TODO:
 # Use DistilBERT or ALBERT for faster training if computational resources are limited.
-# Clustering
-# Deploying using FastAPI
+# Clustering (use raw semantic BERT embeddings), other things that were suggested
+# Interact with data per song, most like an artist, least like an artist
+# Deploy:
+#   Backend on Modal (Nvidia T4) + Hugging face
+#   Serverless Middleware Edge Function to connect the two
+#   Frontend on Vercel
 
 from __future__ import annotations
 
 import json
-import random
-import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
-import torch.nn as nn
 from transformers import (
     BertTokenizer,
     BertForSequenceClassification,
-    get_linear_schedule_with_warmup,
 )
-from torch.optim import AdamW
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    confusion_matrix,
-    classification_report,
-)
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
-from typing import Optional, Sequence, Any
-import optuna
 
-from sklearn.model_selection import train_test_split
+from typing import Optional
 
-from index import ingest_data, chunk_lyric_dataframe
+from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings
 
-RANDOM_SEED = 42
-
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
-
-def set_seed(seed: int = 42) -> None:
-    """Fix all random seeds for reproducible results."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# ---------------------------------------------------------------------------
-# 1. PREPROCESSING
-# ---------------------------------------------------------------------------
-
-class TextClassificationDataset(Dataset):
-    """Tokenizes a list of raw texts and stores BERT-ready tensors."""
-
-    def __init__(
-        self,
-        texts: list[str],
-        labels: list[int],
-        tokenizer: BertTokenizer,
-        max_length: int = 128,
-    ) -> None:
-        if len(texts) != len(labels):
-            raise ValueError(
-                f"texts ({len(texts)}) and labels ({len(labels)}) must have the same length."
-            )
-        self.encodings = tokenizer(
-            texts,
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        self.labels = torch.tensor(labels, dtype=torch.long)
-
-    def __len__(self) -> int:
-        return len(self.labels)
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        return {
-            "input_ids":      self.encodings["input_ids"][idx],
-            "attention_mask": self.encodings["attention_mask"][idx],
-            "token_type_ids": self.encodings["token_type_ids"][idx],
-            "labels":         self.labels[idx],
-        }
-
-
-def preprocess(
-    texts: list[str],
-    labels: list[int],
-    tokenizer: BertTokenizer,
-    max_length: int = 128,
-    val_split: float = 0.15,
-    batch_size: int = 16,
-) -> tuple[DataLoader, DataLoader]:
-    """
-    Tokenize texts and split into train / validation DataLoaders.
-
-    Args:
-        texts:       Raw input strings.
-        labels:      Integer class indices (0-based).
-        tokenizer:   Pre-loaded BertTokenizer.
-        max_length:  Maximum token length (sequences are padded/truncated).
-        val_split:   Fraction of data reserved for validation.
-        batch_size:  Mini-batch size for both loaders.
-
-    Returns:
-        (train_loader, val_loader)
-    """
-    dataset = TextClassificationDataset(texts, labels, tokenizer, max_length)
-
-    val_size   = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-    generator = torch.Generator().manual_seed(RANDOM_SEED) if RANDOM_SEED is not None else None
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
-
-    print(
-        f"[Preprocessing] Total: {len(dataset)} samples  "
-        f"| Train: {train_size}  | Val: {val_size}"
-    )
-    return train_loader, val_loader
-
-
-# ---------------------------------------------------------------------------
-# 2. FINE-TUNING
-# ---------------------------------------------------------------------------
-
-def fine_tune(
-    model: BertForSequenceClassification,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    class_weights_tensor: torch.Tensor | None = None,
-    epochs: int = 3,
-    learning_rate: float = 2e-5,
-    warmup_ratio: float = 0.1,
-    weight_decay: float = 0.01,
-    save_path: Optional[str] = None,
-    trial: Optional[optuna.Trial] = None,
-    early_stopping_patience: Optional[int] = None,
-) -> tuple[BertForSequenceClassification, list[float], list[float]]:
-    """
-    Fine-tune a BertForSequenceClassification model.
-
-    Args:
-        model:          HuggingFace BERT classification model.
-        train_loader:   DataLoader for training data.
-        val_loader:     DataLoader for validation data.
-        class_weights_tensor:  Tensor of class weights for CrossEntropyLoss.
-        device:         torch.device ('cuda' or 'cpu').
-        epochs:         Number of full passes over the training set.
-        learning_rate:  Peak LR for AdamW optimizer.
-        warmup_ratio:   Fraction of total steps used for LR warm-up.
-        weight_decay:   L2 regularization coefficient.
-        save_path:      If provided, save the best checkpoint here.
-        trial:          Optional Optuna trial context.
-        early_stopping_patience: Is the number of epochs to wait for validation loss improvement before stopping.
-
-    Returns:
-        The fine-tuned model (best checkpoint by validation loss).
-    """
-    model.to(device)
-
-    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
-
-    # Optimizer — separate weight decay from bias / LayerNorm parameters
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if not any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": weight_decay,
-        },
-        {
-            "params": [
-                p for n, p in model.named_parameters()
-                if any(nd in n for nd in no_decay)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate)
-
-    total_steps  = len(train_loader) * epochs
-    warmup_steps = int(total_steps * warmup_ratio)
-    scheduler    = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
-
-    best_val_loss = float("inf")
-    best_state    = None
-    early_stop_counter = 0
-
-    train_loss_history, val_loss_history = [], []
-
-    for epoch in range(1, epochs + 1):
-        # ── Training ──────────────────────────────────────────────────────
-        model.train()
-        total_train_loss = 0.0
-
-        try:
-            for step, batch in enumerate(train_loader, start=1):
-                input_ids      = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                token_type_ids = batch["token_type_ids"].to(device)
-                labels         = batch["labels"].to(device)
-
-                optimizer.zero_grad()
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                    labels=labels,
-                )
-                logits = outputs.logits
-                loss = criterion(logits, labels)
-                loss.backward()
-
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                optimizer.step()
-                scheduler.step()
-
-                total_train_loss += loss.item()
-                if step % max(1, len(train_loader) // 5) == 0:
-                    avg = total_train_loss / step
-                    print(f"  Epoch {epoch} | Step {step:>4}/{len(train_loader)} | Train Loss: {avg:.4f}")
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print("  ✗ Out of Memory detected. Clearing CUDA cache and pruning trial.")
-                torch.cuda.empty_cache()
-                raise optuna.TrialPruned()
-            else:
-                raise e
-
-        avg_train_loss = total_train_loss / len(train_loader)
-
-        # ── Validation ────────────────────────────────────────────────────
-        model.eval()
-        total_val_loss = 0.0
-        all_preds, all_labels = [], []
-
-        try:
-            with torch.no_grad():
-                for batch in val_loader:
-                    input_ids      = batch["input_ids"].to(device)
-                    attention_mask = batch["attention_mask"].to(device)
-                    token_type_ids = batch["token_type_ids"].to(device)
-                    labels         = batch["labels"].to(device)
-
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        token_type_ids=token_type_ids,
-                        labels=labels,
-                    )
-                    total_val_loss += outputs.loss.item()
-                    preds = torch.argmax(outputs.logits, dim=-1)
-                    all_preds.extend(preds.cpu().numpy())
-                    all_labels.extend(labels.cpu().numpy())
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print("  ✗ Out of Memory detected during validation. Clearing CUDA cache and pruning trial.")
-                torch.cuda.empty_cache()
-                raise optuna.TrialPruned()
-            else:
-                raise e
-
-        avg_val_loss = total_val_loss / len(val_loader)
-        val_acc      = accuracy_score(all_labels, all_preds)
-
-        train_loss_history.append(avg_train_loss)
-        val_loss_history.append(avg_val_loss)
-
-        print(
-            f"\nEpoch {epoch}/{epochs} Summary\n"
-            f"  Train Loss : {avg_train_loss:.4f}\n"
-            f"  Val   Loss : {avg_val_loss:.4f}\n"
-            f"  Val   Acc  : {val_acc:.4f}\n"
-        )
-
-        # Save best checkpoint
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_state    = {k: v.clone() for k, v in model.state_dict().items()}
-            early_stop_counter = 0
-            if save_path:
-                torch.save(best_state, save_path)
-                print(f"  ✓ Best checkpoint saved → {save_path}\n")
-        else:
-            if early_stopping_patience is not None:
-                early_stop_counter += 1
-                if early_stop_counter >= early_stopping_patience:
-                    print(f"  ⚠ Early stopping triggered: validation loss did not improve for {early_stopping_patience} epochs.\n")
-                    break
-
-        if trial is not None:
-            trial.report(avg_val_loss, step=epoch)
-            if trial.should_prune():
-                print(f"  ✗ Trial pruned by Optuna at epoch {epoch}\n")
-                raise optuna.TrialPruned()
-
-    # Restore best weights before returning
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    return model, train_loss_history, val_loss_history
 
 def load_saved_model(save_path: str, model: BertForSequenceClassification) -> BertForSequenceClassification:
     """
@@ -342,81 +35,6 @@ def load_saved_model(save_path: str, model: BertForSequenceClassification) -> Be
     state_dict = torch.load(save_path)
     model.load_state_dict(state_dict)
     return model
-
-# ---------------------------------------------------------------------------
-# 3. EVALUATION
-# ---------------------------------------------------------------------------
-
-def evaluate(
-    model: BertForSequenceClassification,
-    data_loader: DataLoader,
-    device: torch.device,
-    label_names: Optional[list[str]] = None,
-) -> dict:
-    """
-    Evaluate the model and print a full diagnostics report.
-
-    Args:
-        model:        Fine-tuned classification model.
-        data_loader:  DataLoader for the evaluation split.
-        device:       torch.device.
-        label_names:  Human-readable class names (optional).
-
-    Returns:
-        Dictionary with keys: accuracy, f1_macro, f1_weighted,
-        confusion_matrix, classification_report.
-    """
-    model.eval()
-    model.to(device)
-
-    all_preds, all_labels = [], []
-
-    with torch.no_grad():
-        for batch in data_loader:
-            input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            token_type_ids = batch["token_type_ids"].to(device)
-            labels         = batch["labels"].to(device)
-
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-            )
-            preds = torch.argmax(outputs.logits, dim=-1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    acc         = accuracy_score(all_labels, all_preds)
-    f1_macro    = f1_score(all_labels, all_preds, average="macro")
-    f1_weighted = f1_score(all_labels, all_preds, average="weighted")
-    cm          = confusion_matrix(all_labels, all_preds)
-    cr          = classification_report(
-        all_labels, all_preds,
-        target_names=label_names,
-        zero_division=0,
-    )
-
-    print("=" * 55)
-    print("EVALUATION RESULTS")
-    print("=" * 55)
-    print(f"  Accuracy         : {acc:.4f}")
-    print(f"  F1 (macro)       : {f1_macro:.4f}")
-    print(f"  F1 (weighted)    : {f1_weighted:.4f}")
-    print("\nConfusion Matrix:")
-    print(cm)
-    print("\nClassification Report:")
-    print(cr)
-    print("=" * 55)
-
-    return {
-        "accuracy":               acc,
-        "f1_macro":               f1_macro,
-        "f1_weighted":            f1_weighted,
-        "confusion_matrix":       cm,
-        "classification_report":  cr,
-    }
-
 
 # ---------------------------------------------------------------------------
 # Inference helper
@@ -465,262 +83,7 @@ def predict(
     return predictions
 
 
-def _extract_cls_embeddings(
-    model: BertForSequenceClassification,
-    tokenizer: BertTokenizer,
-    device: torch.device,
-    texts: Sequence[str],
-    max_length: int,
-    batch_size: int,
-) -> np.ndarray:
-    """Extract [CLS] embeddings for each input text."""
-    embeddings = []
 
-    for i in range(0, len(texts), batch_size):
-        batch_texts = list(texts[i : i + batch_size])
-        encodings = tokenizer(
-            batch_texts,
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        with torch.no_grad():
-            outputs = model.bert(
-                input_ids=encodings["input_ids"].to(device),
-                attention_mask=encodings["attention_mask"].to(device),
-                token_type_ids=encodings["token_type_ids"].to(device),
-            )
-        batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-        embeddings.append(batch_embeddings)
-
-    return np.vstack(embeddings)
-
-
-def _aggregate_embeddings_by_group(
-    embeddings: np.ndarray,
-    group_ids: Sequence[str],
-    labels: Optional[Sequence[str]] = None,
-) -> tuple[np.ndarray, Optional[list[str]]]:
-    """Average chunk-level embeddings into one embedding per group ID."""
-    if len(embeddings) != len(group_ids):
-        raise ValueError("embeddings and group_ids must have the same length")
-    if labels is not None and len(labels) != len(group_ids):
-        raise ValueError("labels and group_ids must have the same length")
-
-    group_order: list[str] = []
-    group_to_vectors: dict[str, list[np.ndarray]] = {}
-    group_to_label: dict[str, str] = {}
-
-    for idx, group_id in enumerate(group_ids):
-        if group_id not in group_to_vectors:
-            group_order.append(group_id)
-            group_to_vectors[group_id] = []
-        group_to_vectors[group_id].append(embeddings[idx])
-
-        if labels is not None and group_id not in group_to_label:
-            group_to_label[group_id] = str(labels[idx])
-
-    group_embeddings = np.vstack(
-        [np.mean(np.vstack(group_to_vectors[group_id]), axis=0) for group_id in group_order]
-    )
-    group_labels = [group_to_label[group_id] for group_id in group_order] if labels is not None else None
-    return group_embeddings, group_labels
-
-
-# ---------------------------------------------------------------------------
-# Visualize embeddings
-# ---------------------------------------------------------------------------
-
-def tsne_visualize_embeddings(
-    model: BertForSequenceClassification,
-    tokenizer: BertTokenizer,
-    device: torch.device,
-    texts: list[str],
-    song_ids: list[str],
-    labels: Optional[list[str]] = None,
-    max_length: int = 128,
-    batch_size: int = 16,
-):
-    """
-    Visualize embeddings of the given texts using the model.
-
-    Args:
-        model: Pretrained BERT model.
-        tokenizer: BERT tokenizer.
-        device: Torch device.
-        texts: List of chunked texts to visualize.
-        song_ids: Song identifier for each chunk in texts.
-        labels: Optional list of labels for coloring each song embedding.
-        max_length: Maximum token length for the tokenizer.
-        batch_size: Batch size for processing texts.
-    """
-    model.eval()
-    model.to(device)
-    chunk_embeddings = _extract_cls_embeddings(
-        model,
-        tokenizer,
-        device,
-        texts,
-        max_length=max_length,
-        batch_size=batch_size,
-    )
-    song_embeddings, song_labels = _aggregate_embeddings_by_group(
-        chunk_embeddings,
-        song_ids,
-        labels=labels,
-    )
-
-    print(
-        f"Generated embeddings for {len(texts)} chunks and aggregated to "
-        f"{len(song_embeddings)} songs, performing TSNE..."
-    )
-
-    tsne = TSNE(n_components=2, random_state=RANDOM_SEED)
-    embeddings_2d = tsne.fit_transform(song_embeddings)
-
-    plt.figure(figsize=(10, 10))
-    if song_labels is not None:
-        for label in set(song_labels):
-            idxs = [i for i, l in enumerate(song_labels) if l == label]
-            plt.scatter(embeddings_2d[idxs, 0], embeddings_2d[idxs, 1], label=label)
-        plt.legend()
-    else:
-        plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1])
-    plt.show()
-
-def pca_visualize_embeddings(
-    model: BertForSequenceClassification,
-    tokenizer: BertTokenizer,
-    device: torch.device,
-    texts: list[str],
-    song_ids: list[str],
-    labels: Optional[list[str]] = None,
-    max_length: int = 128,
-    batch_size: int = 16,
-):
-    model.eval()
-    model.to(device)
-    chunk_embeddings = _extract_cls_embeddings(
-        model,
-        tokenizer,
-        device,
-        texts,
-        max_length=max_length,
-        batch_size=batch_size,
-    )
-    song_embeddings, song_labels = _aggregate_embeddings_by_group(
-        chunk_embeddings,
-        song_ids,
-        labels=labels,
-    )
-
-    print(
-        f"Generated embeddings for {len(texts)} chunks and aggregated to "
-        f"{len(song_embeddings)} songs, performing PCA..."
-    )
-    pca = PCA(n_components=2, random_state=RANDOM_SEED)
-    embeddings_2d = pca.fit_transform(song_embeddings)
-
-    plt.figure(figsize=(10, 10))
-    if song_labels is not None:
-        for label in set(song_labels):
-            idxs = [i for i, l in enumerate(song_labels) if l == label]
-            plt.scatter(embeddings_2d[idxs, 0], embeddings_2d[idxs, 1], label=label)
-        plt.legend()
-    else:
-        plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1])
-    plt.show()
-
-
-# ---------------------------------------------------------------------------
-# Hyperparameter Optimization with Optuna
-# ---------------------------------------------------------------------------
-
-def optimize_hyperparameters(
-    lyrics: list[str],
-    label_nums: list[int],
-    tokenizer: BertTokenizer,
-    device: torch.device,
-    num_labels: int,
-    class_weights_tensor: torch.Tensor | None = None,
-    n_trials: int = 3,
-    epochs: int = 3,
-    max_length: int = 128,
-) -> dict[str, Any]:
-    """
-    Run Bayesian Optimization with Optuna to find the optimal hyperparameters:
-    learning_rate, weight_decay, warmup_ratio, and batch_size.
-    Uses Optuna's MedianPruner and validation-based early stopping to save compute.
-    """
-    # Prepare loaders
-    batch_size = 32
-    train_loader, val_loader = preprocess(
-        lyrics, label_nums, tokenizer,
-        max_length=max_length,
-        val_split=0.2,
-        batch_size=batch_size,
-    )
-
-    def objective(trial: optuna.Trial) -> float:
-        # Suggest hyperparameters
-        lr = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
-        weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
-        warmup_ratio = trial.suggest_float("warmup_ratio", 0.0, 0.2)
-        #batch_size = trial.suggest_categorical("batch_size", [32])
-
-        print(
-            f"\n[Optuna Trial {trial.number}] Suggested hyperparameters: "
-            f"learning_rate={lr:.6e}, weight_decay={weight_decay:.6e}, warmup_ratio={warmup_ratio:.4f}, batch_size={batch_size}"
-        )
-
-        # Initialize fresh model each trial configuration
-        model = BertForSequenceClassification.from_pretrained(
-            "bert-base-uncased", num_labels=num_labels
-        )
-
-        try:
-            # We tune for 'epochs' but early stop model weight updates inside fine_tune (early_stopping_patience=1)
-            # and report validation performance metrics to Optuna after each epoch.
-            _, _, val_loss_history = fine_tune(
-                model=model,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                device=device,
-                class_weights_tensor=class_weights_tensor,
-                epochs=epochs,
-                learning_rate=lr,
-                warmup_ratio=warmup_ratio,
-                weight_decay=weight_decay,
-                save_path=None,  # skip saving intermediate trial checkpoints
-                trial=trial,
-                early_stopping_patience=1,  # Stop trial model epoch training if val loss doesn't improve
-            )
-            # Metric to minimize is the best validation loss achieved in this trial
-            best_val_loss = min(val_loss_history) if val_loss_history else float("inf")
-            return best_val_loss
-        except optuna.TrialPruned:
-            raise
-        except Exception as e:
-            print(f"Exception during trial {trial.number}: {e}")
-            return float("inf")
-
-    # Set up Optuna study with MedianPruner for early stopping pruning of trials
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=1, n_warmup_steps=1)
-    study = optuna.create_study(direction="minimize", pruner=pruner)
-    study.optimize(objective, n_trials=n_trials)
-
-    print("\n" + "=" * 55)
-    print("HYPERPARAMETER OPTIMIZATION COMPLETE")
-    print("=" * 55)
-    print(f"Best Trial: #{study.best_trial.number}")
-    print(f"  Best Validation Loss: {study.best_value:.4f}")
-    print("Best Hyperparameters:")
-    for param_name, param_val in study.best_params.items():
-        print(f"  {param_name}: {param_val}")
-    print("=" * 55)
-
-    return study.best_params
 
 
 if __name__ == "__main__":
@@ -732,12 +95,9 @@ if __name__ == "__main__":
     MODEL_NAME     = "bert-base-uncased"
     NUM_LABELS     = len(ARTISTS)
     MAX_LENGTH     = 128
-    EPOCHS         = 4
-    OPTUNA_TRIALS  = 3
     BATCH_SIZE     = 32
-    LOAD_MODEL     = True  # set to False to fine-tune from scratch
-    SAVE_PATH_BERT = "saved_model/best_bert_classifier.pt"  # set to None to skip saving
-    SAVE_PATH_LBLS = "saved_model/label_map.json"  # set to None to skip saving label map
+    SAVE_PATH_BERT = "saved_model/best_bert_classifier.pt"
+    SAVE_PATH_LBLS = "saved_model/label_map.json"
 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -759,14 +119,8 @@ if __name__ == "__main__":
         max_tokens=MAX_LENGTH,
         overlap=MAX_LENGTH//8,
     )
-    artist_to_index = {}
-    if LOAD_MODEL:
-        with open(SAVE_PATH_LBLS, "r") as f:
-            artist_to_index = json.load(f)
-    else:
-        artist_to_index = {artist: idx for idx, artist in enumerate(ARTISTS)}
-        with open(SAVE_PATH_LBLS, "w") as f:
-            json.dump(artist_to_index, f)
+    with open(SAVE_PATH_LBLS, "r") as f:
+        artist_to_index = json.load(f)
     label_nums = [artist_to_index[artist] for artist in artists]
 
     # ── 3. Class weights calculations ─────────────────────────────────────
@@ -783,57 +137,14 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
     )
 
-    if LOAD_MODEL:
-        print(f"Skipping stage 2 & 3, loading saved model from: {SAVE_PATH_BERT}")
-        final_model = BertForSequenceClassification.from_pretrained(
-            MODEL_NAME, num_labels=NUM_LABELS
-        )
-        final_model = load_saved_model(SAVE_PATH_BERT, final_model)
-    else:
-        # ── 4. Hyperparameter Optimization with Optuna ────────────────────────
-        print("\n[Stage 2] Running Bayesian Optimization with Optuna...")
-        best_params = optimize_hyperparameters(
-            lyrics=lyrics,
-            label_nums=label_nums,
-            tokenizer=tokenizer,
-            device=device,
-            num_labels=NUM_LABELS,
-            class_weights_tensor=class_weights_tensor,
-            n_trials=OPTUNA_TRIALS,
-            epochs=EPOCHS,
-            max_length=MAX_LENGTH,
-        )
-
-        # Extract best hyperparams
-        best_lr = best_params["learning_rate"]
-        best_weight_decay = best_params["weight_decay"]
-        best_warmup_ratio = best_params["warmup_ratio"]
-        # best_batch_size = best_params["batch_size"]
-
-        # ── 5. Fine-tune Final Model with Optimal Hyperparameters ──────────────
-        print("\n[Stage 3] Fine-tuning final model with optimal hyperparameters...\n")
-        
-        # Load fresh model for final training
-        final_model = BertForSequenceClassification.from_pretrained(
-            MODEL_NAME, num_labels=NUM_LABELS
-        )
-
-        final_model, train_loss_history, val_loss_history = fine_tune(
-            model=final_model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device=device,
-            class_weights_tensor=class_weights_tensor,
-            epochs=EPOCHS,
-            learning_rate=best_lr,
-            weight_decay=best_weight_decay,
-            warmup_ratio=best_warmup_ratio,
-            save_path=SAVE_PATH_BERT,
-            early_stopping_patience=1,  # Early stop the final run too if it starts overfitting
-        )
+    print(f"Loading saved model from: {SAVE_PATH_BERT}")
+    final_model = BertForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=NUM_LABELS
+    )
+    final_model = load_saved_model(SAVE_PATH_BERT, final_model)
 
     # ── 6. Evaluate ───────────────────────────────────────────────────────
-    print("\n[Stage 4] Evaluating on validation set...\n")
+    print("\n[Stage 2] Evaluating on validation set...\n")
     metrics = evaluate(final_model, val_loader, device, label_names=list(ARTISTS))
 
     # # ── 7. Inference example ──────────────────────────────────────────────
@@ -851,5 +162,5 @@ if __name__ == "__main__":
     #     print(f"  '{text}'  →  {label}")
 
     # Visualize embeddings with PCA
-    print("\n[Stage 5] Visualizing embeddings with PCA...\n")
+    print("\n[Stage 3] Visualizing embeddings with PCA...\n")
     pca_visualize_embeddings(final_model, tokenizer, device, lyrics, song_ids, artists)
