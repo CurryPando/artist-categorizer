@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datasets import load_dataset
 import random
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,6 +20,9 @@ from sklearn.metrics import (
 )
 from sklearn.decomposition import PCA
 from typing import Optional, Sequence
+
+import sys
+import re
 
 
 RANDOM_SEED = 42
@@ -39,15 +44,51 @@ def set_seed(seed: int = 42) -> None:
 # INGEST DATA
 # ---------------------------------------------------------------------------
 
-def ingest_data(file_path: str, artists: set[str]) -> pd.DataFrame:
-    print('loading data')
-    raw_data = pd.read_csv(file_path)
-    raw_data = raw_data[raw_data['artist'].isin(artists)][['artist', 'song', 'lyric']]
-    raw_data.dropna(inplace=True)
-    for column in ['artist', 'song', 'lyric']:
-        if not pd.api.types.is_string_dtype(raw_data[column]):
-            raise ValueError(f"Column '{column}' must be of string type.")
-    return raw_data
+def ingest_data(
+    artists: set[str],
+    hf_dataset: str,
+    hf_split: str = "train",
+    cache_path: str | None = None,
+) -> pd.DataFrame:
+    """
+    Load and normalize lyric data.
+
+    Returns a dataframe with canonical columns: artist, song, lyric.
+    """
+
+    if cache_path:
+        cache_file = Path(cache_path)
+        if cache_file.exists():
+            print(f"Loading cached dataset from: {cache_file}")
+            return pd.read_csv(cache_file, keep_default_na=False)
+
+    ds = load_dataset(hf_dataset, split=hf_split, streaming=True)
+    
+    artists_lower = {artist.lower() for artist in artists}
+    
+    records = []
+    for record in ds:
+        artist = record.get('artist', '')
+        if artist.lower() in artists_lower:
+            records.append({
+                'artist': artist,
+                'song': record.get('title', ''),
+                'lyric': re.sub(r'\[.*?\]', '', record.get('lyrics', '')),
+            })
+
+            sys.stdout.write(f"\rMatches found: {len(records)}")
+            sys.stdout.flush()
+    print("\nIngestion done")
+    df = pd.DataFrame(records)
+
+    if cache_path:
+        cache_file = Path(cache_path)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache_file, index=False)
+        print(f"Saved cached dataset to: {cache_file}")
+
+    return df
+
 
 
 def chunk_lyric_dataframe(
@@ -74,6 +115,7 @@ def chunk_lyric_dataframe(
     overlap : int
         The number of tokens to overlap between consecutive chunks.
     """
+    print("Chunking lyrics into overlapping token-based chunks...")
     stride = max_tokens - overlap
     
     if stride <= 0:
@@ -317,7 +359,7 @@ def _aggregate_embeddings_by_group(
     embeddings: np.ndarray,
     group_ids: Sequence[str],
     labels: Optional[Sequence[str]] = None,
-) -> tuple[np.ndarray, Optional[list[str]]]:
+) -> tuple[list[str], np.ndarray, Optional[list[str]]]:
     """Average chunk-level embeddings into one embedding per group ID."""
     if len(embeddings) != len(group_ids):
         raise ValueError("embeddings and group_ids must have the same length")
@@ -341,7 +383,7 @@ def _aggregate_embeddings_by_group(
         [np.mean(np.vstack(group_to_vectors[group_id]), axis=0) for group_id in group_order]
     )
     group_labels = [group_to_label[group_id] for group_id in group_order] if labels is not None else None
-    return group_embeddings, group_labels
+    return group_order, group_embeddings, group_labels
 
 
 def pca_visualize_embeddings(
@@ -364,7 +406,7 @@ def pca_visualize_embeddings(
         max_length=max_length,
         batch_size=batch_size,
     )
-    song_embeddings, song_labels = _aggregate_embeddings_by_group(
+    song_order, song_embeddings, song_labels = _aggregate_embeddings_by_group(
         chunk_embeddings,
         song_ids,
         labels=labels,
@@ -382,6 +424,8 @@ def pca_visualize_embeddings(
         for label in set(song_labels):
             idxs = [i for i, l in enumerate(song_labels) if l == label]
             plt.scatter(embeddings_2d[idxs, 0], embeddings_2d[idxs, 1], label=label)
+        for i, song_id in enumerate(song_order):
+            plt.annotate(song_id, (embeddings_2d[i, 0], embeddings_2d[i, 1]))
         plt.legend()
     else:
         plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1])

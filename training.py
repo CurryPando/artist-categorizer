@@ -7,10 +7,12 @@ Three stages:
   3. Evaluation     - accuracy, F1, confusion matrix, classification report
 
 Dependencies:
-    pip install torch transformers scikit-learn numpy
+    pip install torch transformers scikit-learn numpy datasets
 """
 
 from __future__ import annotations
+
+from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings, load_dataset
 
 import json
 import torch
@@ -28,7 +30,6 @@ from sklearn.metrics import (
 from typing import Optional, Any
 import optuna
 
-from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -317,16 +318,18 @@ def optimize_hyperparameters(
 
 if __name__ == "__main__":
     set_seed(RANDOM_SEED)
-    DATA_PATH = "updated_rappers.csv"
-    ARTISTS = {'Drake', 'Eminem', 'Future', 'Kendrick Lamar', 'Kanye West'}
+    DATASET_NAME = "theelderemo/genius-lyrics-cleaned"
+    DATASET_SPLIT = "train"
+    ARTISTS = {'Kendrick Lamar', 'Kanye West'}
+    CACHE_PATH = "saved_model/cached_dataset.csv"
 
     # Configuration
     MODEL_NAME     = "bert-base-uncased"
     NUM_LABELS     = len(ARTISTS)
     MAX_LENGTH     = 128
-    EPOCHS         = 4
+    EPOCHS         = 3
     OPTUNA_TRIALS  = 3
-    BATCH_SIZE     = 32
+    BATCH_SIZE     = 16
     SAVE_PATH_BERT = "saved_model/best_bert_classifier.pt"
     SAVE_PATH_LBLS = "saved_model/label_map.json"
 
@@ -340,7 +343,12 @@ if __name__ == "__main__":
 
     # ── 2. Preprocess ─────────────────────────────────────────────────────
     print("\n[Stage 1] Preprocessing...")
-    df = ingest_data(DATA_PATH, ARTISTS)
+    df = ingest_data(
+        artists=ARTISTS,
+        hf_dataset=DATASET_NAME,
+        hf_split=DATASET_SPLIT,
+        cache_path=CACHE_PATH,
+    )
 
     # Training Data
     artists, lyrics, song_ids = chunk_lyric_dataframe(

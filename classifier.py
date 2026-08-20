@@ -2,14 +2,13 @@
 # Use DistilBERT or ALBERT for faster training if computational resources are limited.
 # Clustering (use raw semantic BERT embeddings), other things that were suggested
 # Interact with data per song, most like an artist, least like an artist
-# Deploy:
-#   Backend on Modal (Nvidia T4) + Hugging face
-#   Serverless Middleware Edge Function to connect the two
-#   Frontend on Vercel
 
 from __future__ import annotations
 
+from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings, load_dataset
+
 import json
+from pathlib import Path
 import torch
 from transformers import (
     BertTokenizer,
@@ -18,7 +17,6 @@ from transformers import (
 
 from typing import Optional
 
-from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings
 
 
 def load_saved_model(save_path: str, model: BertForSequenceClassification) -> BertForSequenceClassification:
@@ -85,17 +83,18 @@ def predict(
 
 
 
-
 if __name__ == "__main__":
     set_seed(RANDOM_SEED)
-    DATA_PATH = "updated_rappers.csv"
-    ARTISTS = {'Drake', 'Eminem', 'Future', 'Kendrick Lamar', 'Kanye West'}
+    DATASET_NAME = "theelderemo/genius-lyrics-cleaned"
+    DATASET_SPLIT = "train"
+    ARTISTS = {'Kendrick Lamar', 'Kanye West'}
+    CACHE_PATH = Path("saved_model") / "cached_dataset.csv"
 
     # Configuration
     MODEL_NAME     = "bert-base-uncased"
     NUM_LABELS     = len(ARTISTS)
     MAX_LENGTH     = 128
-    BATCH_SIZE     = 32
+    BATCH_SIZE     = 16
     SAVE_PATH_BERT = "saved_model/best_bert_classifier.pt"
     SAVE_PATH_LBLS = "saved_model/label_map.json"
 
@@ -109,7 +108,11 @@ if __name__ == "__main__":
 
     # ── 2. Preprocess ─────────────────────────────────────────────────────
     print("\n[Stage 1] Preprocessing...")
-    df = ingest_data(DATA_PATH, ARTISTS)
+    df = ingest_data(artists=ARTISTS,
+        hf_dataset=DATASET_NAME,
+        hf_split=DATASET_SPLIT,
+        cache_path=str(CACHE_PATH),
+    )
 
     # Training Data
     artists, lyrics, song_ids = chunk_lyric_dataframe(
@@ -144,23 +147,45 @@ if __name__ == "__main__":
     final_model = load_saved_model(SAVE_PATH_BERT, final_model)
 
     # ── 6. Evaluate ───────────────────────────────────────────────────────
-    print("\n[Stage 2] Evaluating on validation set...\n")
-    metrics = evaluate(final_model, val_loader, device, label_names=list(ARTISTS))
+    # print("\n[Stage 2] Evaluating on validation set...\n")
+    # metrics = evaluate(final_model, val_loader, device, label_names=list(ARTISTS))
 
     # # ── 7. Inference example ──────────────────────────────────────────────
-    # test_texts = [
-    #     "I like beating women",
-    #     "I love to rap and spit fire like Eminem.",
-    # ]
-    # print("\n[Inference] Predicting on new texts...")
-    # predictions = predict(
-    #     test_texts, final_model, tokenizer, device,
-    #     max_length=MAX_LENGTH,
-    #     label_names=list(ARTISTS),
-    # )
-    # for text, label in zip(test_texts, predictions):
-    #     print(f"  '{text}'  →  {label}")
+    test_texts = [
+"""Know you wonder where the F he been (Where he been)
+But I'm back to life like an Epi-Pen
+And she still in the leopard skin
+And I check me out, then check me in
+See this coat, nigga?
+
+Bye-bye to my old self (Old self)
+Wake up to the new me (It's a new me)
+I used to be on Worldstar (Worldstar)
+Now I'm making Newsweek (Newsweek)
+I used to hang on the 9 (On the 9)
+Now I bought two streets (Two streets)
+Cottage Grove to King Drive (King Drive)
+Yeah, this life is a movie (Movie)
+Bye-bye to my old self (Old self)
+Wake up to the new me (It's a new me)
+I used to be on Worldstar (Worldstar)
+Now I'm making Newsweek (Newsweek)
+I used to hang on the 9 (On the 9)
+Now I bought two streets (Two streets)
+Cottage Grove to King Drive (King Drive)
+Yeah, this life is a movie (Movie)""",
+    ]
+    print("\n[Inference] Predicting on new texts...")
+    predictions = predict(
+        test_texts, final_model, tokenizer, device,
+        max_length=MAX_LENGTH,
+        label_names=list(ARTISTS),
+    )
+    for text, label in zip(test_texts, predictions):
+        print(f"  '{text}'  →  {label}")
 
     # Visualize embeddings with PCA
-    print("\n[Stage 3] Visualizing embeddings with PCA...\n")
-    pca_visualize_embeddings(final_model, tokenizer, device, lyrics, song_ids, artists)
+    # print("\n[Stage 3] Visualizing embeddings with PCA...\n")
+    bert_base = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_LABELS)
+    # pca_visualize_embeddings(final_model, tokenizer, device, lyrics, song_ids, artists)
+    pca_visualize_embeddings(bert_base, tokenizer, device, lyrics, song_ids, artists)
