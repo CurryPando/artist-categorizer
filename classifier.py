@@ -5,21 +5,22 @@
 
 from __future__ import annotations
 
-from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings, load_dataset
+from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings
 
 import json
-from pathlib import Path
 import torch
 from transformers import (
-    BertTokenizer,
-    BertForSequenceClassification,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    PreTrainedTokenizerBase,
+    PreTrainedModel,
 )
 
 from typing import Optional
 
 
 
-def load_saved_model(save_path: str, model: BertForSequenceClassification) -> BertForSequenceClassification:
+def load_saved_model(save_path: str, model: PreTrainedModel) -> PreTrainedModel:
     """
     Load a saved model checkpoint.
 
@@ -40,8 +41,8 @@ def load_saved_model(save_path: str, model: BertForSequenceClassification) -> Be
 
 def predict(
     texts: list[str],
-    model: BertForSequenceClassification,
-    tokenizer: BertTokenizer,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
     device: torch.device,
     max_length: int = 128,
     batch_size: int = 16,
@@ -70,7 +71,6 @@ def predict(
             outputs = model(
                 input_ids=encodings["input_ids"].to(device),
                 attention_mask=encodings["attention_mask"].to(device),
-                token_type_ids=encodings["token_type_ids"].to(device),
             )
         preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
         if label_names:
@@ -85,13 +85,11 @@ def predict(
 
 if __name__ == "__main__":
     set_seed(RANDOM_SEED)
-    DATASET_NAME = "theelderemo/genius-lyrics-cleaned"
-    DATASET_SPLIT = "train"
+    TRAIN_CSV_PATH = "train_df.csv"
     ARTISTS = {'Kendrick Lamar', 'Kanye West'}
-    CACHE_PATH = Path("saved_model") / "cached_dataset.csv"
 
     # Configuration
-    MODEL_NAME     = "bert-base-uncased"
+    MODEL_NAME     = "answerdotai/ModernBERT-base"
     NUM_LABELS     = len(ARTISTS)
     MAX_LENGTH     = 128
     BATCH_SIZE     = 16
@@ -104,14 +102,12 @@ if __name__ == "__main__":
 
     # ── 1. Load tokenizer ─────────────────────────────────────────────────
     print(f"Loading tokenizer: {MODEL_NAME}")
-    tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     # ── 2. Preprocess ─────────────────────────────────────────────────────
     print("\n[Stage 1] Preprocessing...")
     df = ingest_data(artists=ARTISTS,
-        hf_dataset=DATASET_NAME,
-        hf_split=DATASET_SPLIT,
-        cache_path=str(CACHE_PATH),
+        csv_path=TRAIN_CSV_PATH,
     )
 
     # Training Data
@@ -134,14 +130,14 @@ if __name__ == "__main__":
     
     # Prepare loaders
     train_loader, val_loader = preprocess(
-        lyrics, label_nums, tokenizer,
+        lyrics, label_nums, song_ids, tokenizer,
         max_length=MAX_LENGTH,
         val_split=0.2,
         batch_size=BATCH_SIZE,
     )
 
     print(f"Loading saved model from: {SAVE_PATH_BERT}")
-    final_model = BertForSequenceClassification.from_pretrained(
+    final_model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME, num_labels=NUM_LABELS
     )
     final_model = load_saved_model(SAVE_PATH_BERT, final_model)
@@ -186,6 +182,6 @@ Yeah, this life is a movie (Movie)""",
 
     # Visualize embeddings with PCA
     # print("\n[Stage 3] Visualizing embeddings with PCA...\n")
-    bert_base = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_LABELS)
+    modernbert_base = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_LABELS)
     # pca_visualize_embeddings(final_model, tokenizer, device, lyrics, song_ids, artists)
-    pca_visualize_embeddings(bert_base, tokenizer, device, lyrics, song_ids, artists)
+    pca_visualize_embeddings(modernbert_base, tokenizer, device, lyrics, song_ids, artists)

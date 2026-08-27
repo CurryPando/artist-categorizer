@@ -1,9 +1,9 @@
 """
-BERT Text Classification Pipeline
-==================================
+ModernBERT Text Classification Pipeline
+========================================
 Three stages:
-  1. Preprocessing  - tokenize raw texts into BERT-ready tensors
-  2. Fine-tuning    - train a BertForSequenceClassification model
+  1. Preprocessing  - tokenize raw texts into ModernBERT-ready tensors
+  2. Fine-tuning    - train a ModernBertForSequenceClassification model
   3. Evaluation     - accuracy, F1, confusion matrix, classification report
 
 Dependencies:
@@ -11,16 +11,19 @@ Dependencies:
 """
 
 from __future__ import annotations
+import os
 
-from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings, load_dataset
+from process_eval_funcs import RANDOM_SEED, set_seed, ingest_data, chunk_lyric_dataframe, preprocess, evaluate, pca_visualize_embeddings
 
 import json
 import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
 from transformers import (
-    BertTokenizer,
-    BertForSequenceClassification,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    PreTrainedTokenizerBase,
+    PreTrainedModel,
     get_linear_schedule_with_warmup,
 )
 from torch.optim import AdamW
@@ -37,7 +40,7 @@ import optuna
 # ---------------------------------------------------------------------------
 
 def fine_tune(
-    model: BertForSequenceClassification,
+    model: PreTrainedModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
     device: torch.device,
@@ -49,12 +52,12 @@ def fine_tune(
     save_path: Optional[str] = None,
     trial: Optional[optuna.Trial] = None,
     early_stopping_patience: Optional[int] = None,
-) -> tuple[BertForSequenceClassification, list[float], list[float]]:
+) -> tuple[PreTrainedModel, list[float], list[float]]:
     """
-    Fine-tune a BertForSequenceClassification model.
+    Fine-tune a ModernBertForSequenceClassification model.
 
     Args:
-        model:          HuggingFace BERT classification model.
+        model:          HuggingFace ModernBERT classification model.
         train_loader:   DataLoader for training data.
         val_loader:     DataLoader for validation data.
         class_weights_tensor:  Tensor of class weights for CrossEntropyLoss.
@@ -117,18 +120,16 @@ def fine_tune(
             for step, batch in enumerate(train_loader, start=1):
                 input_ids      = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
-                token_type_ids = batch["token_type_ids"].to(device)
                 labels         = batch["labels"].to(device)
 
                 optimizer.zero_grad()
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                    labels=labels,
-                )
-                logits = outputs.logits
-                loss = criterion(logits, labels)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    loss = criterion(outputs.logits, labels)
                 loss.backward()
 
                 # Gradient clipping for stability
@@ -161,15 +162,14 @@ def fine_tune(
                 for batch in val_loader:
                     input_ids      = batch["input_ids"].to(device)
                     attention_mask = batch["attention_mask"].to(device)
-                    token_type_ids = batch["token_type_ids"].to(device)
                     labels         = batch["labels"].to(device)
 
-                    outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        token_type_ids=token_type_ids,
-                        labels=labels,
-                    )
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                        )
                     total_val_loss += outputs.loss.item()
                     preds = torch.argmax(outputs.logits, dim=-1)
                     all_preds.extend(preds.cpu().numpy())
@@ -230,23 +230,26 @@ def fine_tune(
 def optimize_hyperparameters(
     lyrics: list[str],
     label_nums: list[int],
-    tokenizer: BertTokenizer,
+    song_ids: list[str],
+    tokenizer: PreTrainedTokenizerBase,
     device: torch.device,
     num_labels: int,
+    model_name: str = "answerdotai/ModernBERT-base",
     class_weights_tensor: torch.Tensor | None = None,
-    n_trials: int = 3,
-    epochs: int = 3,
+    n_trials: int = 12,
+    epochs: int = 4,
     max_length: int = 128,
+    batch_size: int = 32,
 ) -> dict[str, Any]:
     """
     Run Bayesian Optimization with Optuna to find the optimal hyperparameters:
-    learning_rate, weight_decay, warmup_ratio, and batch_size.
-    Uses Optuna's MedianPruner and validation-based early stopping to save compute.
+    learning_rate, weight_decay, and warmup_ratio.
+    Uses Optuna's HyperbandPruner for multi-fidelity search (prunes weak trials early using
+    partial, per-epoch results instead of always training to completion).
     """
     # Prepare loaders
-    batch_size = 32
     train_loader, val_loader = preprocess(
-        lyrics, label_nums, tokenizer,
+        lyrics, label_nums, song_ids, tokenizer,
         max_length=max_length,
         val_split=0.2,
         batch_size=batch_size,
@@ -254,10 +257,9 @@ def optimize_hyperparameters(
 
     def objective(trial: optuna.Trial) -> float:
         # Suggest hyperparameters
-        lr = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
-        weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
-        warmup_ratio = trial.suggest_float("warmup_ratio", 0.0, 0.2)
-        #batch_size = trial.suggest_categorical("batch_size", [32])
+        lr = trial.suggest_float("learning_rate", 1e-5, 8e-5, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-2, 1e-1, log=True)
+        warmup_ratio = trial.suggest_float("warmup_ratio", 0.05, 0.15)
 
         print(
             f"\n[Optuna Trial {trial.number}] Suggested hyperparameters: "
@@ -265,13 +267,13 @@ def optimize_hyperparameters(
         )
 
         # Initialize fresh model each trial configuration
-        model = BertForSequenceClassification.from_pretrained(
-            "bert-base-uncased", num_labels=num_labels
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, attn_implementation="flash_attention_2", dtype=torch.bfloat16, num_labels=num_labels
         )
 
         try:
-            # We tune for 'epochs' but early stop model weight updates inside fine_tune (early_stopping_patience=1)
-            # and report validation performance metrics to Optuna after each epoch.
+            # HyperbandPruner (via trial.should_prune() inside fine_tune) decides when to stop
+            # a trial early, so we don't also apply internal validation-loss early stopping here.
             _, _, val_loss_history = fine_tune(
                 model=model,
                 train_loader=train_loader,
@@ -284,7 +286,7 @@ def optimize_hyperparameters(
                 weight_decay=weight_decay,
                 save_path=None,  # skip saving intermediate trial checkpoints
                 trial=trial,
-                early_stopping_patience=1,  # Stop trial model epoch training if val loss doesn't improve
+                early_stopping_patience=None,
             )
             # Metric to minimize is the best validation loss achieved in this trial
             best_val_loss = min(val_loss_history) if val_loss_history else float("inf")
@@ -295,9 +297,16 @@ def optimize_hyperparameters(
             print(f"Exception during trial {trial.number}: {e}")
             return float("inf")
 
-    # Set up Optuna study with MedianPruner for early stopping pruning of trials
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=1, n_warmup_steps=1)
-    study = optuna.create_study(direction="minimize", pruner=pruner)
+    # Multi-fidelity BO: HyperbandPruner runs successive-halving brackets over the
+    # per-epoch val loss reported in fine_tune, pairing well with TPE's model-based search.
+    # reduction_factor=2 gives finer-grained rungs (1, 2, 4) given the small epoch budget.
+    pruner = optuna.pruners.HyperbandPruner(
+        min_resource=1,
+        max_resource=epochs,
+        reduction_factor=2,
+    )
+    sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED, multivariate=True)
+    study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
     study.optimize(objective, n_trials=n_trials)
 
     print("\n" + "=" * 55)
@@ -318,20 +327,60 @@ def optimize_hyperparameters(
 
 if __name__ == "__main__":
     set_seed(RANDOM_SEED)
-    DATASET_NAME = "theelderemo/genius-lyrics-cleaned"
-    DATASET_SPLIT = "train"
-    ARTISTS = {'Kendrick Lamar', 'Kanye West'}
-    CACHE_PATH = "saved_model/cached_dataset.csv"
+    TRAIN_CSV_PATH = "train_df.csv"
+    ARTISTS = {
+        "Drake",
+        "Eminem",
+        "Kanye West",
+        "Kendrick Lamar",
+        "J. Cole",
+        "XXXTENTACION",
+        "Travis Scott",
+        "Lil Wayne",
+        "JAY-Z",
+        "Juice WRLD",
+        "Future",
+        "Nicki Minaj",
+        "Tyler, The Creator",
+        "Lil Uzi Vert",
+        "A$AP Rocky",
+        "Migos",
+        "Cardi B",
+        "2Pac",
+        "Young Thug",
+        "Mac Miller",
+        "YoungBoy Never Broke Again",
+        "Chance the Rapper",
+        "Chief Keef",
+        "The Notorious B.I.G.",
+        "Nas",
+        "Playboi Carti",
+        "Fetty Wap",
+        "Kid Cudi",
+        "50 Cent",
+        "ScHoolboy Q",
+        "A Tribe Called Quest",
+        "Common",
+        "2 Chainz",
+        "Gucci Mane",
+        "Earl Sweatshirt",
+        "Pop Smoke",
+        "Pusha T",
+        "OutKast",
+    }
 
     # Configuration
-    MODEL_NAME     = "bert-base-uncased"
+    MODEL_NAME     = "answerdotai/ModernBERT-base"
     NUM_LABELS     = len(ARTISTS)
     MAX_LENGTH     = 128
-    EPOCHS         = 3
-    OPTUNA_TRIALS  = 3
-    BATCH_SIZE     = 16
+    USE_SAVED_HYPERPARAMS = True
+    SEARCH_EPOCHS  = 4   # epoch budget for each Optuna/Hyperband trial
+    FINAL_EPOCHS   = 6   # epoch budget for the final fine-tune with the best hyperparameters
+    OPTUNA_TRIALS  = 12  # enough trials for Hyperband to run multiple successive-halving brackets
+    BATCH_SIZE     = 32
     SAVE_PATH_BERT = "saved_model/best_bert_classifier.pt"
     SAVE_PATH_LBLS = "saved_model/label_map.json"
+    BEST_HYPERPARAMS_PATH = "saved_model/best_hyperparameters.json"
 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -339,15 +388,13 @@ if __name__ == "__main__":
 
     # ── 1. Load tokenizer ─────────────────────────────────────────────────
     print(f"Loading tokenizer: {MODEL_NAME}")
-    tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     # ── 2. Preprocess ─────────────────────────────────────────────────────
     print("\n[Stage 1] Preprocessing...")
     df = ingest_data(
         artists=ARTISTS,
-        hf_dataset=DATASET_NAME,
-        hf_split=DATASET_SPLIT,
-        cache_path=CACHE_PATH,
+        csv_path=TRAIN_CSV_PATH,
     )
 
     # Training Data
@@ -358,6 +405,7 @@ if __name__ == "__main__":
         max_tokens=MAX_LENGTH,
         overlap=MAX_LENGTH//8,
     )
+
     artist_to_index = {artist: idx for idx, artist in enumerate(ARTISTS)}
     with open(SAVE_PATH_LBLS, "w") as f:
         json.dump(artist_to_index, f)
@@ -371,25 +419,36 @@ if __name__ == "__main__":
     
     # Prepare loaders
     train_loader, val_loader = preprocess(
-        lyrics, label_nums, tokenizer,
+        lyrics, label_nums, song_ids, tokenizer,
         max_length=MAX_LENGTH,
         val_split=0.2,
         batch_size=BATCH_SIZE,
     )
 
-    # ── 4. Hyperparameter Optimization with Optuna ────────────────────────
-    print("\n[Stage 2] Running Bayesian Optimization with Optuna...")
-    best_params = optimize_hyperparameters(
-        lyrics=lyrics,
-        label_nums=label_nums,
-        tokenizer=tokenizer,
-        device=device,
-        num_labels=NUM_LABELS,
-        class_weights_tensor=class_weights_tensor,
-        n_trials=OPTUNA_TRIALS,
-        epochs=EPOCHS,
-        max_length=MAX_LENGTH,
-    )
+    if USE_SAVED_HYPERPARAMS and os.path.exists(BEST_HYPERPARAMS_PATH):
+        with open(BEST_HYPERPARAMS_PATH, "r") as f:
+            best_params = json.load(f)
+    else:
+        # ── 4. Hyperparameter Optimization with Optuna ────────────────────────
+        print("\n[Stage 2] Running Bayesian Optimization with Optuna...")
+        best_params = optimize_hyperparameters(
+            lyrics=lyrics,
+            label_nums=label_nums,
+            song_ids=song_ids,
+            tokenizer=tokenizer,
+            device=device,
+            num_labels=NUM_LABELS,
+            model_name=MODEL_NAME,
+            class_weights_tensor=class_weights_tensor,
+            n_trials=OPTUNA_TRIALS,
+            epochs=SEARCH_EPOCHS,
+            max_length=MAX_LENGTH,
+            batch_size=BATCH_SIZE,
+        )
+
+        # Write best hyperparameters to a file for future reference
+        with open(BEST_HYPERPARAMS_PATH, "w") as f:
+            json.dump(best_params, f)
 
     # Extract best hyperparams
     best_lr = best_params["learning_rate"]
@@ -398,10 +457,10 @@ if __name__ == "__main__":
 
     # ── 5. Fine-tune Final Model with Optimal Hyperparameters ──────────────
     print("\n[Stage 3] Fine-tuning final model with optimal hyperparameters...\n")
-    
+
     # Load fresh model for final training
-    final_model = BertForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=NUM_LABELS
+    final_model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, attn_implementation="flash_attention_2", dtype=torch.bfloat16, num_labels=NUM_LABELS
     )
 
     final_model, train_loss_history, val_loss_history = fine_tune(
@@ -410,12 +469,12 @@ if __name__ == "__main__":
         val_loader=val_loader,
         device=device,
         class_weights_tensor=class_weights_tensor,
-        epochs=EPOCHS,
+        epochs=FINAL_EPOCHS,
         learning_rate=best_lr,
         weight_decay=best_weight_decay,
         warmup_ratio=best_warmup_ratio,
         save_path=SAVE_PATH_BERT,
-        early_stopping_patience=1,  # Early stop the final run too if it starts overfitting
+        early_stopping_patience=2,  # Early stop the final run too if it starts overfitting
     )
 
     # ── 6. Evaluate ───────────────────────────────────────────────────────

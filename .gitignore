@@ -1,6 +1,4 @@
 saved_model/
-updated_rappers.csv
-loss_plot.png
-.venv
+*.csv
+*.png
 modal_script.py
-__pycache__/

@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from datasets import load_dataset
 import random
-from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from transformers import (
-    BertTokenizer,
-    BertForSequenceClassification,
+    PreTrainedTokenizerBase,
+    PreTrainedModel,
 )
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -21,7 +20,6 @@ from sklearn.metrics import (
 from sklearn.decomposition import PCA
 from typing import Optional, Sequence
 
-import sys
 import re
 
 
@@ -44,56 +42,46 @@ def set_seed(seed: int = 42) -> None:
 # INGEST DATA
 # ---------------------------------------------------------------------------
 
+def _deduplicate_stanzas(lyric: str) -> str:
+    """Drop repeated stanzas (e.g. repeated choruses) from a lyric block, keeping first occurrences in order."""
+    stanzas = [s.strip() for s in re.split(r'\n\s*\n', lyric) if s.strip()]
+    seen: set[str] = set()
+    deduped = []
+    for stanza in stanzas:
+        if stanza in seen:
+            continue
+        seen.add(stanza)
+        deduped.append(stanza)
+    return '\n\n'.join(deduped)
+
+
 def ingest_data(
     artists: set[str],
-    hf_dataset: str,
-    hf_split: str = "train",
-    cache_path: str | None = None,
+    csv_path: str,
 ) -> pd.DataFrame:
     """
-    Load and normalize lyric data.
+    Load and normalize lyric data from a local CSV export
+    (columns: id, title, tag, artist, year, views, lyrics).
 
     Returns a dataframe with canonical columns: artist, song, lyric.
     """
+    df = pd.read_csv(csv_path, keep_default_na=False)
 
-    if cache_path:
-        cache_file = Path(cache_path)
-        if cache_file.exists():
-            print(f"Loading cached dataset from: {cache_file}")
-            return pd.read_csv(cache_file, keep_default_na=False)
-
-    ds = load_dataset(hf_dataset, split=hf_split, streaming=True)
-    
     artists_lower = {artist.lower() for artist in artists}
-    
-    records = []
-    for record in ds:
-        artist = record.get('artist', '')
-        if artist.lower() in artists_lower:
-            records.append({
-                'artist': artist,
-                'song': record.get('title', ''),
-                'lyric': re.sub(r'\[.*?\]', '', record.get('lyrics', '')),
-            })
+    df = df[df['artist'].str.lower().isin(artists_lower)]
 
-            sys.stdout.write(f"\rMatches found: {len(records)}")
-            sys.stdout.flush()
-    print("\nIngestion done")
-    df = pd.DataFrame(records)
+    df = df.rename(columns={'title': 'song', 'lyrics': 'lyric'})[['artist', 'song', 'lyric']]
+    df['lyric'] = df['lyric'].str.replace(r'\[.*?\]', '', regex=True)
+    df['lyric'] = df['lyric'].apply(_deduplicate_stanzas)
 
-    if cache_path:
-        cache_file = Path(cache_path)
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache_file, index=False)
-        print(f"Saved cached dataset to: {cache_file}")
-
-    return df
+    print(f"Ingestion done: {len(df)} matching rows")
+    return df.reset_index(drop=True)
 
 
 
 def chunk_lyric_dataframe(
     df: pd.DataFrame,
-    tokenizer: BertTokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     min_tokens: int = 64,
     max_tokens: int = 128,
     overlap: int = 16,
@@ -106,7 +94,7 @@ def chunk_lyric_dataframe(
     -----------
     df : pd.DataFrame
         Input dataframe with 'artist', 'song', and 'lyric' columns.
-    tokenizer : BertTokenizer
+    tokenizer : PreTrainedTokenizerBase
         The Hugging Face tokenizer to use.
     min_tokens : int
         The minimum number of tokens a chunk must have to be kept (prevents tiny trailing chunks).
@@ -177,7 +165,7 @@ class _TextClassificationDataset(Dataset):
         self,
         texts: list[str],
         labels: list[int],
-        tokenizer: BertTokenizer,
+        tokenizer: PreTrainedTokenizerBase,
         max_length: int = 128,
     ) -> None:
         if len(texts) != len(labels):
@@ -200,7 +188,6 @@ class _TextClassificationDataset(Dataset):
         return {
             "input_ids":      self.encodings["input_ids"][idx],
             "attention_mask": self.encodings["attention_mask"][idx],
-            "token_type_ids": self.encodings["token_type_ids"][idx],
             "labels":         self.labels[idx],
         }
 
@@ -208,7 +195,8 @@ class _TextClassificationDataset(Dataset):
 def preprocess(
     texts: list[str],
     labels: list[int],
-    tokenizer: BertTokenizer,
+    song_ids: Sequence[str],
+    tokenizer: PreTrainedTokenizerBase,
     max_length: int = 128,
     val_split: float = 0.15,
     batch_size: int = 16,
@@ -216,10 +204,14 @@ def preprocess(
     """
     Tokenize texts and split into train / validation DataLoaders.
 
+    Splits by song (via song_ids) rather than by chunk, so chunks from the same
+    song never leak across both splits and inflate validation performance.
+
     Args:
         texts:       Raw input strings.
         labels:      Integer class indices (0-based).
-        tokenizer:   Pre-loaded BertTokenizer.
+        song_ids:    Group id (e.g. 'artist::song') for each text, one per chunk.
+        tokenizer:   Pre-loaded tokenizer.
         max_length:  Maximum token length (sequences are padded/truncated).
         val_split:   Fraction of data reserved for validation.
         batch_size:  Mini-batch size for both loaders.
@@ -229,17 +221,18 @@ def preprocess(
     """
     dataset = _TextClassificationDataset(texts, labels, tokenizer, max_length)
 
-    val_size   = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-    generator = torch.Generator().manual_seed(RANDOM_SEED) if RANDOM_SEED is not None else None
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+    splitter = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=RANDOM_SEED)
+    train_idx, val_idx = next(splitter.split(texts, labels, groups=song_ids))
+
+    train_dataset = Subset(dataset, train_idx)
+    val_dataset   = Subset(dataset, val_idx)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
 
     print(
-        f"[Preprocessing] Total: {len(dataset)} samples  "
-        f"| Train: {train_size}  | Val: {val_size}"
+        f"[Preprocessing] Total: {len(dataset)} samples across {len(set(song_ids))} songs  "
+        f"| Train: {len(train_idx)}  | Val: {len(val_idx)}"
     )
     return train_loader, val_loader
 
@@ -249,7 +242,7 @@ def preprocess(
 # ---------------------------------------------------------------------------
 
 def evaluate(
-    model: BertForSequenceClassification,
+    model: PreTrainedModel,
     data_loader: DataLoader,
     device: torch.device,
     label_names: Optional[list[str]] = None,
@@ -276,13 +269,11 @@ def evaluate(
         for batch in data_loader:
             input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            token_type_ids = batch["token_type_ids"].to(device)
             labels         = batch["labels"].to(device)
 
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
             )
             preds = torch.argmax(outputs.logits, dim=-1)
             all_preds.extend(preds.cpu().numpy())
@@ -324,8 +315,8 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 def _extract_cls_embeddings(
-    model: BertForSequenceClassification,
-    tokenizer: BertTokenizer,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
     device: torch.device,
     texts: Sequence[str],
     max_length: int,
@@ -344,10 +335,10 @@ def _extract_cls_embeddings(
             return_tensors="pt",
         )
         with torch.no_grad():
-            outputs = model.bert(
+            # ModernBERT exposes its encoder as `.model` (no `.bert` attribute, no token_type_ids)
+            outputs = model.model(
                 input_ids=encodings["input_ids"].to(device),
                 attention_mask=encodings["attention_mask"].to(device),
-                token_type_ids=encodings["token_type_ids"].to(device),
             )
         batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
         embeddings.append(batch_embeddings)
@@ -387,8 +378,8 @@ def _aggregate_embeddings_by_group(
 
 
 def pca_visualize_embeddings(
-    model: BertForSequenceClassification,
-    tokenizer: BertTokenizer,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
     device: torch.device,
     texts: list[str],
     song_ids: list[str],
