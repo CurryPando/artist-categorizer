@@ -86,7 +86,35 @@ def predict(
 if __name__ == "__main__":
     set_seed(RANDOM_SEED)
     TRAIN_CSV_PATH = "train_df.csv"
-    ARTISTS = {'Kendrick Lamar', 'Kanye West'}
+    ARTISTS = {
+        "Drake",
+        "Eminem",
+        "Kanye West",
+        "Kendrick Lamar",
+        "J. Cole",
+        "Travis Scott",
+        "Lil Wayne",
+        "JAY-Z",
+        "Juice WRLD",
+        "Future",
+        "Nicki Minaj",
+        "Tyler, The Creator",
+        "Lil Uzi Vert",
+        "Migos",
+        "2Pac",
+        "Young Thug",
+        "Mac Miller",
+        "YoungBoy Never Broke Again",
+        "Chief Keef",
+        "Nas",
+        "Playboi Carti",
+        "Kid Cudi",
+        "50 Cent",
+        "A Tribe Called Quest",
+        "Common",
+        "Gucci Mane",
+        "Pop Smoke",
+    }
 
     # Configuration
     MODEL_NAME     = "answerdotai/ModernBERT-base"
@@ -106,7 +134,8 @@ if __name__ == "__main__":
 
     # ── 2. Preprocess ─────────────────────────────────────────────────────
     print("\n[Stage 1] Preprocessing...")
-    df = ingest_data(artists=ARTISTS,
+    df = ingest_data(
+        artists=ARTISTS,
         csv_path=TRAIN_CSV_PATH,
     )
 
@@ -121,6 +150,8 @@ if __name__ == "__main__":
     with open(SAVE_PATH_LBLS, "r") as f:
         artist_to_index = json.load(f)
     label_nums = [artist_to_index[artist] for artist in artists]
+    # Order label names by index, not set iteration order (which is hash-seed dependent across processes)
+    label_names = [artist for artist, _ in sorted(artist_to_index.items(), key=lambda kv: kv[1])]
 
     # ── 3. Class weights calculations ─────────────────────────────────────
     class_counts = [label_nums.count(i) for i in range(NUM_LABELS)]
@@ -138,50 +169,56 @@ if __name__ == "__main__":
 
     print(f"Loading saved model from: {SAVE_PATH_BERT}")
     final_model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=NUM_LABELS
+        MODEL_NAME, attn_implementation="flash_attention_2", dtype=torch.bfloat16, num_labels=NUM_LABELS
     )
     final_model = load_saved_model(SAVE_PATH_BERT, final_model)
 
     # ── 6. Evaluate ───────────────────────────────────────────────────────
-    # print("\n[Stage 2] Evaluating on validation set...\n")
-    # metrics = evaluate(final_model, val_loader, device, label_names=list(ARTISTS))
+    print("\n[Stage 2] Evaluating on validation set...\n")
+    metrics = evaluate(final_model, val_loader, device, label_names=label_names)
 
-    # # ── 7. Inference example ──────────────────────────────────────────────
-    test_texts = [
-"""Know you wonder where the F he been (Where he been)
-But I'm back to life like an Epi-Pen
-And she still in the leopard skin
-And I check me out, then check me in
-See this coat, nigga?
+    confusion_matrix = metrics["confusion_matrix"]
+    # get most confused pairs of artists
+    most_confused = []
+    for i in range(NUM_LABELS):
+        for j in range(NUM_LABELS):
+            if i != j:
+                most_confused.append((confusion_matrix[i][j], label_names[i], label_names[j]))
+    most_confused.sort(reverse=True)
+    print("\nMost confused pairs of artists:")
+    for count, artist1, artist2 in most_confused[:10]:
+        print(f"{artist1} vs {artist2}: {count}")
 
-Bye-bye to my old self (Old self)
-Wake up to the new me (It's a new me)
-I used to be on Worldstar (Worldstar)
-Now I'm making Newsweek (Newsweek)
-I used to hang on the 9 (On the 9)
-Now I bought two streets (Two streets)
-Cottage Grove to King Drive (King Drive)
-Yeah, this life is a movie (Movie)
-Bye-bye to my old self (Old self)
-Wake up to the new me (It's a new me)
-I used to be on Worldstar (Worldstar)
-Now I'm making Newsweek (Newsweek)
-I used to hang on the 9 (On the 9)
-Now I bought two streets (Two streets)
-Cottage Grove to King Drive (King Drive)
-Yeah, this life is a movie (Movie)""",
-    ]
-    print("\n[Inference] Predicting on new texts...")
-    predictions = predict(
-        test_texts, final_model, tokenizer, device,
-        max_length=MAX_LENGTH,
-        label_names=list(ARTISTS),
-    )
-    for text, label in zip(test_texts, predictions):
-        print(f"  '{text}'  →  {label}")
+    # ── 7. Inference example ──────────────────────────────────────────────
+#     test_texts = [
+# """Know you wonder where the F he been (Where he been)
+# But I'm back to life like an Epi-Pen
+# And she still in the leopard skin
+# And I check me out, then check me in
+# See this coat, nigga?
 
-    # Visualize embeddings with PCA
-    # print("\n[Stage 3] Visualizing embeddings with PCA...\n")
-    modernbert_base = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_LABELS)
-    # pca_visualize_embeddings(final_model, tokenizer, device, lyrics, song_ids, artists)
-    pca_visualize_embeddings(modernbert_base, tokenizer, device, lyrics, song_ids, artists)
+# Bye-bye to my old self (Old self)
+# Wake up to the new me (It's a new me)
+# I used to be on Worldstar (Worldstar)
+# Now I'm making Newsweek (Newsweek)
+# I used to hang on the 9 (On the 9)
+# Now I bought two streets (Two streets)
+# Cottage Grove to King Drive (King Drive)
+# Yeah, this life is a movie (Movie)
+# Bye-bye to my old self (Old self)
+# Wake up to the new me (It's a new me)
+# I used to be on Worldstar (Worldstar)
+# Now I'm making Newsweek (Newsweek)
+# I used to hang on the 9 (On the 9)
+# Now I bought two streets (Two streets)
+# Cottage Grove to King Drive (King Drive)
+# Yeah, this life is a movie (Movie)""",
+#     ]
+#     print("\n[Inference] Predicting on new texts...")
+#     predictions = predict(
+#         test_texts, final_model, tokenizer, device,
+#         max_length=MAX_LENGTH,
+#         label_names=label_names,
+#     )
+#     for text, label in zip(test_texts, predictions):
+#         print(f"  '{text}'  →  {label}")

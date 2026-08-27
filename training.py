@@ -334,7 +334,6 @@ if __name__ == "__main__":
         "Kanye West",
         "Kendrick Lamar",
         "J. Cole",
-        "XXXTENTACION",
         "Travis Scott",
         "Lil Wayne",
         "JAY-Z",
@@ -343,37 +342,27 @@ if __name__ == "__main__":
         "Nicki Minaj",
         "Tyler, The Creator",
         "Lil Uzi Vert",
-        "A$AP Rocky",
         "Migos",
-        "Cardi B",
         "2Pac",
         "Young Thug",
         "Mac Miller",
         "YoungBoy Never Broke Again",
-        "Chance the Rapper",
         "Chief Keef",
-        "The Notorious B.I.G.",
         "Nas",
         "Playboi Carti",
-        "Fetty Wap",
         "Kid Cudi",
         "50 Cent",
-        "ScHoolboy Q",
         "A Tribe Called Quest",
         "Common",
-        "2 Chainz",
         "Gucci Mane",
-        "Earl Sweatshirt",
         "Pop Smoke",
-        "Pusha T",
-        "OutKast",
     }
 
     # Configuration
     MODEL_NAME     = "answerdotai/ModernBERT-base"
     NUM_LABELS     = len(ARTISTS)
     MAX_LENGTH     = 128
-    USE_SAVED_HYPERPARAMS = True
+    USE_SAVED_HYPERPARAMS = True # will find best hyperparameters and generate best_hyperparameters.json if False
     SEARCH_EPOCHS  = 4   # epoch budget for each Optuna/Hyperband trial
     FINAL_EPOCHS   = 6   # epoch budget for the final fine-tune with the best hyperparameters
     OPTUNA_TRIALS  = 12  # enough trials for Hyperband to run multiple successive-halving brackets
@@ -410,6 +399,8 @@ if __name__ == "__main__":
     with open(SAVE_PATH_LBLS, "w") as f:
         json.dump(artist_to_index, f)
     label_nums = [artist_to_index[artist] for artist in artists]
+    # Order label names by index, not set iteration order (which is hash-seed dependent across processes)
+    label_names = [artist for artist, _ in sorted(artist_to_index.items(), key=lambda kv: kv[1])]
 
     # ── 3. Class weights calculations ─────────────────────────────────────
     class_counts = [label_nums.count(i) for i in range(NUM_LABELS)]
@@ -479,8 +470,10 @@ if __name__ == "__main__":
 
     # ── 6. Evaluate ───────────────────────────────────────────────────────
     print("\n[Stage 4] Evaluating on validation set...\n")
-    metrics = evaluate(final_model, val_loader, device, label_names=list(ARTISTS))
+    metrics = evaluate(final_model, val_loader, device, label_names=label_names)
 
+    """
     # Visualize embeddings with PCA
     print("\n[Stage 5] Visualizing embeddings with PCA...\n")
     pca_visualize_embeddings(final_model, tokenizer, device, lyrics, song_ids, artists)
+    """
